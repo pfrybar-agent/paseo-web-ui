@@ -1,0 +1,93 @@
+# Lints, builds for amd64 and arm64, tests the amd64 build, and publishes both
+# to GHCR from main only. The image only downloads files and copies them in, so
+# one runner builds both architectures without emulation.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Not IMAGE: tests/image.sh reads IMAGE.
+  REGISTRY_IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  check:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: shellcheck
+        run: shellcheck tests/image.sh
+
+      - name: Caddyfile is formatted
+        run: docker run --rm -v "$PWD/Caddyfile:/Caddyfile:ro" caddy:2.10.2-alpine caddy fmt --diff /Caddyfile
+
+  image:
+    name: Build, test and publish
+    needs: check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      # The image is tagged with the Paseo version it serves.
+      - name: Read the Paseo version
+        run: echo "PASEO_VERSION=$(sed -n 's/^ARG PASEO_VERSION=//p' Dockerfile)" >> "$GITHUB_ENV"
+
+      #   <version>      the newest build of that Paseo version
+      #   latest         the newest build of main
+      #   sha-<commit>   the build of one commit, to pin or roll back to
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            type=raw,value=${{ env.PASEO_VERSION }}
+            type=raw,value=latest
+            type=sha,format=short
+
+      # Loaded into the runner's Docker under the name tests/image.sh expects.
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          platforms: linux/amd64
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: paseo-web-ui:test
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test
+        run: tests/image.sh
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v7
+        with:
+          platforms: linux/amd64,linux/arm64
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          push: true
+          cache-from: type=gha
